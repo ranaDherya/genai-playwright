@@ -1,50 +1,102 @@
-import { Command } from 'commander';
+// Required Packages
+// npm install axios dotenv simple-git
+
+import axios from 'axios';
+import * as dotenv from 'dotenv';
+import * as fs from 'fs';
 import simpleGit from 'simple-git';
-import fs from 'fs';
-import path from 'path';
 
-const program = new Command();
+dotenv.config();
 
-program
-  .option('--jira <id>', 'JIRA ID to search in commits')
-  .option('--from <date>', 'Start date (YYYY-MM-DD)')
-  .option('--to <date>', 'End date (YYYY-MM-DD)')
-  .parse(process.argv);
+const JIRA_BASE = process.env.JIRA_BASE!;
+const JIRA_EMAIL = process.env.JIRA_EMAIL!;
+const JIRA_TOKEN = process.env.JIRA_TOKEN!;
+const PROJECT_KEY = process.env.JIRA_PROJECT_KEY!;
+const GIT_REPO_PATH = process.env.GIT_REPO_PATH || '.'; // default current dir
 
-const opts = program.opts();
-const jira = opts.jira;
-const from = opts.from;
-const to = opts.to;
+const AUTH_HEADER = {
+  auth: {
+    username: JIRA_EMAIL,
+    password: JIRA_TOKEN
+  },
+  headers: {
+    'Accept': 'application/json'
+  }
+};
 
-if (!jira && (!from || !to)) {
-  console.error('❌ Please provide either --jira or both --from and --to');
-  process.exit(1);
+const JIRA_TAG = `${PROJECT_KEY}-`;
+
+const git = simpleGit(GIT_REPO_PATH);
+
+interface StoryContext {
+  id: string;
+  title: string;
+  description: string;
+  acceptanceCriteria: string[];
+  filesChanged: string[];
 }
 
-async function extractChanges(repoPath: string, label: string) {
-  const git = simpleGit(repoPath);
-  const range = jira
-    ? [`--grep=${jira}`, '--name-only']
-    : [`--since=${from}`, `--until=${to}`, '--name-only'];
-  const log = await git.raw(['log', ...range, '--pretty=format:']);
+async function getStoryIdsFromGit(): Promise<Record<string, string[]>> {
+  const commits = await git.log();
+  const storyCommits: Record<string, string[]> = {};
 
-  const files = Array.from(new Set(log.trim().split('\n').filter(f => f.trim())));
-  return files;
+  for (const commit of commits.all) {
+    const matches = commit.message.match(new RegExp(`${JIRA_TAG}[0-9]+`, 'g'));
+    if (matches) {
+      for (const match of matches) {
+        if (!storyCommits[match]) storyCommits[match] = [];
+        const diff = await git.show([`${commit.hash}`]);
+        const changedFiles = diff
+          .split('\n')
+          .filter(line => line.startsWith('+++ b/') || line.startsWith('--- a/'))
+          .map(line => line.replace(/^(\+\+\+ b\/|--- a\/)/, ''));
+        storyCommits[match].push(...changedFiles);
+      }
+    }
+  }
+
+  return storyCommits;
 }
 
-(async () => {
-  const frontendPath = path.resolve('../frontend');
-  const backendPath = path.resolve('../backend');
+async function getJiraStoryDetails(storyId: string): Promise<StoryContext | null> {
+  try {
+    const res = await axios.get(`${JIRA_BASE}/rest/api/3/issue/${storyId}`, AUTH_HEADER);
+    const fields = res.data.fields;
+    const ac = extractAcceptanceCriteria(fields);
+    return {
+      id: storyId,
+      title: fields.summary,
+      description: fields.description?.content?.[0]?.content?.[0]?.text || '',
+      acceptanceCriteria: ac,
+      filesChanged: [] // added later
+    };
+  } catch (err) {
+    console.error(`❌ Failed to fetch ${storyId}`, err);
+    return null;
+  }
+}
 
-  const frontendFiles = await extractChanges(frontendPath, 'frontend');
-  const backendFiles = await extractChanges(backendPath, 'backend');
+function extractAcceptanceCriteria(fields: any): string[] {
+  const ac = fields.customfield_12345; // ⚠️ Replace with your actual field ID
+  if (Array.isArray(ac)) return ac;
+  if (typeof ac === 'string') return [ac];
+  return [];
+}
 
-  const result = {
-    jira: jira || `${from} to ${to}`,
-    frontend: frontendFiles,
-    backend: backendFiles,
-  };
+async function buildContext(): Promise<void> {
+  const storyCommits = await getStoryIdsFromGit();
+  const context: StoryContext[] = [];
 
-  fs.writeFileSync('changes.json', JSON.stringify(result, null, 2));
-  console.log('✅ Saved to changes.json');
-})();
+  for (const [storyId, filesChanged] of Object.entries(storyCommits)) {
+    const details = await getJiraStoryDetails(storyId);
+    if (details) {
+      details.filesChanged = Array.from(new Set(filesChanged));
+      context.push(details);
+    }
+  }
+
+  fs.writeFileSync('story_context.json', JSON.stringify(context, null, 2));
+  console.log('✅ story_context.json created.');
+}
+
+buildContext();
