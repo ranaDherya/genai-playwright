@@ -1,0 +1,153 @@
+import cv2
+import pytesseract
+from pdf2image import convert_from_path
+import json
+import numpy as np
+
+# ---- Step 1: Convert PDF pages to images ----
+def pdf_to_images(pdf_path, dpi=300):
+    pages = convert_from_path(pdf_path, dpi=dpi)
+    images = []
+    for i, page in enumerate(pages):
+        img_path = f"page_{i+1}.png"
+        page.save(img_path, "PNG")
+        images.append(img_path)
+    return images
+
+
+# ---- Step 2: OCR text extraction with bounding boxes ----
+def extract_text_boxes(image_path):
+    img = cv2.imread(image_path)
+    data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+
+    words = []
+    for i in range(len(data['text'])):
+        if data['text'][i].strip():
+            x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+            words.append({
+                "text": data['text'][i],
+                "bbox": (x, y, x + w, y + h)
+            })
+    return words
+
+
+# ---- Step 3: Detect rectangular boxes (nodes) ----
+def detect_boxes(image_path):
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    _, thresh = cv2.threshold(img, 200, 255, cv2.THRESH_BINARY_INV)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    boxes = []
+    for cnt in contours:
+        approx = cv2.approxPolyDP(cnt, 0.02*cv2.arcLength(cnt, True), True)
+        x, y, w, h = cv2.boundingRect(approx)
+
+        # Filter out noise (only keep big enough boxes)
+        if w > 40 and h > 20:
+            boxes.append((x, y, x + w, y + h))
+    return boxes
+
+
+# ---- Step 4: Detect arrows/lines (edges) ----
+def detect_arrows(image_path):
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    edges = cv2.Canny(img, 50, 150, apertureSize=3)
+
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80,
+                            minLineLength=40, maxLineGap=10)
+
+    arrows = []
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            arrows.append(((x1, y1), (x2, y2)))
+    return arrows
+
+
+# ---- Step 5: Match text into boxes ----
+def assign_text_to_boxes(boxes, words):
+    nodes = []
+    node_id = 1
+    for bx in boxes:
+        bx0, by0, bx1, by1 = bx
+        inside_texts = []
+        for w in words:
+            wx0, wy0, wx1, wy1 = w["bbox"]
+            if (wx0 >= bx0 and wy0 >= by0 and wx1 <= bx1 and wy1 <= by1):
+                inside_texts.append(w["text"])
+        label = " ".join(inside_texts)
+        if label.strip():
+            nodes.append({
+                "id": f"n{node_id}",
+                "label": label,
+                "bbox": bx
+            })
+            node_id += 1
+    return nodes
+
+
+# ---- Step 6: Connect arrows to nearest boxes ----
+def connect_arrows_to_nodes(arrows, nodes):
+    edges = []
+    edge_id = 1
+
+    def center(bbox):
+        x0, y0, x1, y1 = bbox
+        return ((x0 + x1) // 2, (y0 + y1) // 2)
+
+    for arrow in arrows:
+        (x1, y1), (x2, y2) = arrow
+        # Find closest nodes to start and end of arrow
+        start_node, end_node = None, None
+        min_d1, min_d2 = float('inf'), float('inf')
+
+        for node in nodes:
+            cx, cy = center(node["bbox"])
+            d1 = (cx - x1) ** 2 + (cy - y1) ** 2
+            d2 = (cx - x2) ** 2 + (cy - y2) ** 2
+            if d1 < min_d1:
+                min_d1, start_node = d1, node
+            if d2 < min_d2:
+                min_d2, end_node = d2, node
+
+        if start_node and end_node and start_node["id"] != end_node["id"]:
+            edges.append({
+                "id": f"e{edge_id}",
+                "from": start_node["id"],
+                "to": end_node["id"]
+            })
+            edge_id += 1
+    return edges
+
+
+# ---- Step 7: Full pipeline ----
+def workflow_to_graph(pdf_path):
+    images = pdf_to_images(pdf_path)
+    all_graphs = []
+
+    for img in images:
+        words = extract_text_boxes(img)
+        boxes = detect_boxes(img)
+        arrows = detect_arrows(img)
+        nodes = assign_text_to_boxes(boxes, words)
+        edges = connect_arrows_to_nodes(arrows, nodes)
+
+        graph = {"nodes": nodes, "edges": edges}
+        all_graphs.append(graph)
+
+    return all_graphs
+
+
+# ------------------------
+# Example run
+# ------------------------
+if __name__ == "__main__":
+    pdf_path = "workflow.pdf"
+    graphs = workflow_to_graph(pdf_path)
+
+    # Save as JSON for LLM
+    with open("workflow_graph.json", "w") as f:
+        json.dump(graphs, f, indent=2)
+
+    print(json.dumps(graphs, indent=2))
