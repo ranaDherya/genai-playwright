@@ -1,0 +1,99 @@
+import fitz  # PyMuPDF
+import numpy as np
+from sklearn.cluster import DBSCAN
+import json
+import math
+
+# -----------------------------
+# 1. Extract text blocks
+def extract_text_blocks(pdf_path):
+    doc = fitz.open(pdf_path)
+    blocks_all_pages = []
+
+    for page_num, page in enumerate(doc):
+        blocks = page.get_text("blocks")  # [(x0,y0,x1,y1,text,...)]
+        clean_blocks = [(b[0], b[1], b[2], b[3], b[4].strip()) for b in blocks if b[4].strip()]
+        blocks_all_pages.extend(clean_blocks)
+    return blocks_all_pages
+
+# -----------------------------
+# 2. Cluster blocks into boxes & separate notes
+def cluster_boxes(blocks, eps=15, min_samples=2):
+    coords = np.array([[(b[0]+b[2])/2, (b[1]+b[3])/2] for b in blocks])  # block centers
+    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(coords)
+    
+    boxes = []
+    notes = []
+
+    for label in set(clustering.labels_):
+        cluster_blocks = [blocks[i] for i, l in enumerate(clustering.labels_) if l == label]
+        if label == -1:
+            notes.extend([b[4] for b in cluster_blocks])
+        else:
+            x0 = min(b[0] for b in cluster_blocks)
+            y0 = min(b[1] for b in cluster_blocks)
+            x1 = max(b[2] for b in cluster_blocks)
+            y1 = max(b[3] for b in cluster_blocks)
+            text = " ".join(b[4] for b in sorted(cluster_blocks, key=lambda b: b[1]))  # top-to-bottom
+            boxes.append({"id": len(boxes)+1, "text": text, "coords": [x0, y0, x1, y1]})
+    return boxes, notes
+
+# -----------------------------
+# 3. Euclidean distance
+def euclidean_dist(c1, c2):
+    x1, y1 = (c1[0]+c1[2])/2, (c1[1]+c1[3])/2
+    x2, y2 = (c2[0]+c2[2])/2, (c2[1]+c2[3])/2
+    return math.sqrt((x1-x2)**2 + (y1-y2)**2)
+
+# -----------------------------
+# 4. Infer candidate edges based on geometry
+def infer_candidate_edges(boxes, k=2, overlap_thresh=0.1):
+    edges = []
+
+    for box in boxes:
+        candidates = []
+        for other in boxes:
+            if box["id"] == other["id"]:
+                continue
+            # Compute overlap in X and Y
+            x_overlap = max(0, min(box["coords"][2], other["coords"][2]) - max(box["coords"][0], other["coords"][0]))
+            y_overlap = max(0, min(box["coords"][3], other["coords"][3]) - max(box["coords"][1], other["coords"][1]))
+            x_len = box["coords"][2] - box["coords"][0]
+            y_len = box["coords"][3] - box["coords"][1]
+
+            # Accept if overlapping enough
+            if (x_overlap/x_len >= overlap_thresh) or (y_overlap/y_len >= overlap_thresh):
+                dist = euclidean_dist(box["coords"], other["coords"])
+                candidates.append((other["id"], dist))
+        
+        # Keep k nearest candidates
+        candidates.sort(key=lambda x: x[1])
+        for cid, dist in candidates[:k]:
+            edges.append({"from": box["id"], "to": cid, "confidence": round(1/(1+dist), 2)})
+    
+    return edges
+
+# -----------------------------
+# 5. Full workflow pipeline
+def workflow_from_pdf(pdf_path):
+    blocks = extract_text_blocks(pdf_path)
+    boxes, notes = cluster_boxes(blocks)
+    edges = infer_candidate_edges(boxes)
+    
+    workflow = {
+        "boxes": boxes,
+        "edges": edges,
+        "notes": notes
+    }
+    return workflow
+
+# -----------------------------
+# 6. Usage
+pdf_path = "workflow.pdf"
+workflow_json = workflow_from_pdf(pdf_path)
+
+# Save JSON
+with open("workflow.json", "w", encoding="utf-8") as f:
+    json.dump(workflow_json, f, indent=2)
+
+print(json.dumps(workflow_json, indent=2))
